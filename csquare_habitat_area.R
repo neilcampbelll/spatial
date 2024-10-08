@@ -5,9 +5,9 @@ library(sf)
 library(dplyr)
 library(units)
 library(lwgeom)
-library(vmstools)  # Add this line to load the VMStools library
+library(vmstools) 
 
-sf_use_s2(FALSE)
+sf_use_s2(FALSE) # this is needed to stop the habitat layer intersecting with itself and causing problems
 
 # Load the specific layer from the geodatabase
 kat.csq <- get_csquare(ices_area = "3a", convert2sf = TRUE)
