@@ -6,6 +6,10 @@ library(data.table)
 library(dplyr)
 library(tidyr)
 library(vmstools)
+library(sfdSAR)
+## load sample vms data
+#data(test_vms)
+
 sf_use_s2(FALSE)
 
 ## Process a polygon covering the coastline of Div. 3a
@@ -77,7 +81,7 @@ rm(eusm)
 
 # Create a grid of points covering Div. 3a, 100 per c-square
 grid_size <- 0.05
-points_grid <- st_make_grid(ICESareas, cellsize = c(grid_size/3, grid_size/3))
+points_grid <- st_make_grid(ICESareas, cellsize = c(grid_size/10, grid_size/10))
 
 points_df <- points_grid %>%
   st_cast("POINT") %>%
@@ -155,4 +159,77 @@ kat.csq_result_with_areas <- st_as_sf(kat.csq_result_with_areas)
 # Preview the result
 print(head(kat.csq_result_with_areas))
 
-                                                     
+
+### and now work on the table 1 data
+
+country <- c("SE", "DK")
+
+se <- read.csv(paste0("data/data_2024_", country[1] ,"_raw_VE.csv"), header = F)
+dk <- read.csv(paste0("data/data_2024_", country[2] ,"_raw_VE.csv"), header = F)
+
+colnames(se) <- colnames(dk) <- c("RecordType", "CountryCode","Year", "Month", "NoDistinctVessels",
+                                  "AnonymizedVesselID", "C-square", "MetierL4", "MetierL5","MetierL6",
+                                  "VesselLengthRange","HabitatType", "DepthRange", "NumberOfRecords",
+                                  "AverageFishingSpeed","FishingHour","AverageInterval","AverageVesselLength",
+                                  "AveragekW","kWFishingHour", "SweptArea","TotWeight","TotValue","AverageGearWidth")
+
+temp <- rbind(se, dk)
+
+gears <- c("OTB", "OTT")
+
+target <- "CRU"
+
+output <- temp %>%
+  filter(MetierL4 %in% gears) %>%
+  filter(MetierL5 %in% target) %>%
+  filter(Year == 2017) %>%
+  dplyr::select(`C-square`, HabitatType, SweptArea) %>%
+  mutate(SA_km2 = SweptArea/1000000) %>%
+  group_by(`C-square`, HabitatType) %>%
+  summarise(SA = sum(SA_km2))
+
+#Reshape the output data frame
+output_wide <- output %>%
+  pivot_wider(names_from = HabitatType, values_from = SA, values_fill = 0) %>%
+  rename_with(~paste0("SweptArea_", .), -`C-square`)
+
+# Join the reshaped output with kat.csq_result_with_areas
+result <- kat.csq_result_with_areas %>%
+  left_join(output_wide, by = c("c_square" = "C-square"))
+
+#Identify common habitat types
+output_habitat_types <- unique(output$HabitatType)
+kat_habitat_types <- names(kat.csq_result_with_areas)[grep("HabBen", names(kat.csq_result_with_areas))]
+common_habitat_types <- intersect(output_habitat_types, kat_habitat_types)
+
+# Step 4: Calculate ratios for each common habitat type
+for (habitat in common_habitat_types) {
+  swept_area_col <- paste0("SweptArea_", habitat)
+  ratio_col <- paste0("Ratio_", habitat)
+  
+  result <- result %>%
+    mutate(!!ratio_col := ifelse(!!sym(habitat) > 0, 
+                                 !!sym(swept_area_col) / !!sym(habitat), 
+                                 0))
+}
+
+# Print the names of the new columns to verify
+print(names(result))
+
+## probably want to use something more generic if doing it elsewhere
+result <- result %>%
+  dplyr::select(c_square,"Ratio_HabBenBathyalUpSed","Ratio_HabBenOffshMud",                   
+                "Ratio_HabBenOffshSand",                   "Ratio_HabBenOffshMxdSed",                
+                "Ratio_HabBenCircalitMud",                 "Ratio_HabBenInfralitMud",                
+                "Ratio_HabBenInfralitMxdSed",              "Ratio_HabBenInfralitSand",               
+                "Ratio_HabBenCircalitMxdSed",              "Ratio_HabBenOffshRock",                  
+                "Ratio_HabBenCircalitRock"  ,              "Ratio_HabBenCircalitCoarSed",            
+                "Ratio_HabBenInfralitRock"  ,              "Ratio_HabBenBathyalUpReef") %>%
+  as.data.frame()
+
+result[is.na(result)] <- 0
+
+result$wkt <- wkt_csquare(lat = CSquare2LonLat(result$c_square, 0.05)[,1],
+                          lon = CSquare2LonLat(result$c_square, 0.05)[,2])
+
+write.table(result, "skag_kat_2017.wkt", sep = ";", row.names = FALSE)
