@@ -1,26 +1,30 @@
 rm(list=ls())
-
 library(icesVMS)
+library(icesVocab)
 library(sf)
+library(data.table)
 library(dplyr)
-library(units)
-library(lwgeom)
-library(vmstools) 
+library(tidyr)
+library(vmstools)
+sf_use_s2(FALSE)
 
-sf_use_s2(FALSE) # this is needed to stop the habitat layer intersecting with itself and causing problems
+## Process a polygon covering the coastline of Div. 3a
+data(ICESareas)
+ICESareas <- ICESareas %>%
+  dplyr::filter(Area_27 %in% c("3.a.20", "3.a.21"))
+ICESareas <- st_union(ICESareas)
 
-# Load the specific layer from the geodatabase
+## Download the c-squares in 3a from ICES
 kat.csq <- get_csquare(ices_area = "3a", convert2sf = TRUE)
 
-gdb_path <- "C:/Work/WGSFD/ICES-VMS-and-Logbook-Data-Call_refactor/Results/EUSeaMap_2023.gdb"
+# Load the specific layer from the geodatabase
+gdb_path <- "C:/Work/WGSFD/ICES-VMS-and-Logbook-Data-Call_refactor/data/eusm.rds"
 eusm <- readRDS(gdb_path)
 
-# Keep only the "MSFD_BBHT" variable
-eusm <- eusm %>% dplyr::select(MSFD_BBHT)
+# Keep only the "MSFD_BBHT" variable and join with codelist
 codelist <- getCodeList("BroadHabitat")
-
-# Replace full names with abbreviations and handle non-matching habitat types
-eusm <- eusm %>%
+eusm <- eusm %>% 
+  dplyr::select(MSFD_BBHT) %>%
   left_join(codelist, by = c("MSFD_BBHT" = "Description")) %>%
   dplyr::mutate(MSFD_BBHT = dplyr::case_when(
     MSFD_BBHT == "Na" ~ "",
@@ -29,63 +33,82 @@ eusm <- eusm %>%
   )) %>%
   dplyr::select(MSFD_BBHT)
 
-# To speed the function up, create bounding box (0.05 x 0.05 degree)
-# and filter the habitat layer to this first
-bbox_wgs84 <- st_bbox(c(xmin = min(kat.csq$lon)-0.1, 
-                    ymin = min(kat.csq$lat)-0.1, 
-                    xmax = max(kat.csq$lon + 0.1), 
-                    ymax = max(kat.csq$lat + 0.1)), crs = 4326)
-  
-                          
-# Convert bbox to an sf polygon
-bbox_poly_wgs84 <- st_as_sfc(bbox_wgs84)
-                          
-# Transform bbox polygon to the CRS of eusm (which is Web Mercator, EPSG:3857)
-bbox_poly_mercator <- st_transform(bbox_poly_wgs84, st_crs(eusm))
-                          
-# Filter the data
-eusm_filtered <- eusm[st_intersects(eusm, bbox_poly_mercator, sparse = FALSE)[,1], ]
+## set up a bounding box slightly larger than the c-square object
+bbox <- st_bbox(c(xmin = min(kat.csq$lon)-0.1, 
+                        ymin = min(kat.csq$lat)-0.1, 
+                        xmax = max(kat.csq$lon + 0.1), 
+                        ymax = max(kat.csq$lat + 0.1)), crs = 4326)
 
-# Create a function for processing each c-square
-process_csquare <- function(wkt, csquare) {
-  csq <- st_as_sf(wkt)
-  
-  # Calculate the area of this specific c-square
-  csq_area_km2 <- as.numeric(units::set_units(st_area(csq), km^2))
-  
-  set.seed(123)  # for reproducibility
-  points <- st_sample(csq, size = 1000, type = "regular")
-  points_sf_transformed <- st_transform(st_set_crs(st_as_sf(points), 4326), st_crs(eusm_filtered))
-  
-  sampled_points <- st_join(points_sf_transformed, eusm_filtered)
-  
-  habitat_counts <- sampled_points %>%
-    st_drop_geometry() %>%
-    group_by(MSFD_BBHT) %>%
-    summarise(count = n(), .groups = 'drop')
-  
-  results <- habitat_counts %>%
-    mutate(
-      area_estimate_km2 = (count / 1000) * csq_area_km2,
-      csquare = csquare
-    ) %>%
-    dplyr::select(csquare, MSFD_BBHT, area_estimate_km2)
-  
-  return(results)
+bbox_wgs84 <- st_transform(st_as_sfc(bbox), st_crs(eusm))
+
+## Crop the shapefile to the bounding box
+eusm_filtered <- st_crop(eusm, bbox_wgs84)
+
+rm(eusm)
+
+# Create a grid of points covering Div. 3a, 100 per c-square
+grid_size <- 0.05
+points_grid <- st_make_grid(ICESareas, cellsize = c(grid_size/10, grid_size/10))
+
+points_df <- points_grid %>%
+  st_cast("POINT") %>%
+  st_cast("MULTIPOINT") %>%
+  st_cast("POINT") %>%
+  st_as_sf()
+
+# Convert the grid to an sf object
+points_sf <- st_centroid(points_grid)
+
+points_sf <- st_as_sf(data.frame(geometry = points_sf))
+
+# Add coordinates as columns if needed
+points_sf <- points_sf %>%
+  mutate(lon = st_coordinates(.)[,1],
+         lat = st_coordinates(.)[,2])
+
+# Add a unique identifier if needed
+points_sf <- points_sf %>%
+  mutate(id = row_number())
+
+# Now perform the spatial join
+points_habitat <- st_join(points_sf, eusm_filtered)
+
+points_habitat$CSquare <- vmstools::CSquare(points_habitat$lon, points_habitat$lat, 0.05)
+
+# Count points of each habitat type within each CSquare
+habitat_counts <- points_habitat %>%
+  st_drop_geometry() %>%  # Remove geometry to speed up grouping
+  group_by(CSquare) %>%
+  mutate(total_points = n()) %>%
+  group_by(CSquare, MSFD_BBHT, total_points) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  mutate(proportion = count / total_points) %>%
+  select(-count, -total_points)
+
+# Pivot the data to create columns for each habitat type
+habitat_proportions_wide <- habitat_counts %>%
+  pivot_wider(
+    id_cols = CSquare,
+    names_from = MSFD_BBHT,
+    values_from = proportion,
+    values_fill = list(proportion = 0)
+  )
+
+# Join the proportions back to the original polygon data
+kat.csq_result_with_areas <- kat.csq_result %>%
+  left_join(habitat_proportions_wide, by = c("c_square" = "CSquare"))
+
+# Replace NA values with 0 for the new habitat columns
+habitat_columns <- setdiff(names(habitat_proportions_wide), "CSquare")
+kat.csq_result_with_areas[habitat_columns] <- lapply(kat.csq_result_with_areas[habitat_columns], function(x) replace(x, is.na(x), 0))
+
+# Multiply proportions by area_km2 to get estimated habitat areas
+for (col in habitat_columns) {
+  kat.csq_result_with_areas[[col]] <- kat.csq_result_with_areas[[col]] * kat.csq_result_with_areas$area_km2
 }
 
-# Use lapply for processing
-results_list <- lapply(1:nrow(kat.csq), function(i) {
-  result <- process_csquare(kat.csq$wkt[i], kat.csq$c_square[i])
-  if (i %% 100 == 0) print(paste("Processed", i, "of", nrow(kat.csq)))
-  return(result)
-})
+# Ensure the result is still an sf object (it should be, but just to be safe)
+kat.csq_result_with_areas <- st_as_sf(kat.csq_result_with_areas)
 
-# Combine results
-results.out <- do.call(rbind, results_list)
-
-# Convert to data.table for faster operations if needed
-results.out <- as.data.table(results.out)
-
-# Print the results
-print(results.out)
+# Preview the result
+print(head(kat.csq_result_with_areas))
